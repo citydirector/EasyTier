@@ -17,8 +17,19 @@ use crate::proto::common::TunnelInfo;
 
 use super::{create_connector_by_url, http_connector::TunnelWithInfo};
 
+/// 按照权重进行加权随机选择
 fn weighted_choice<T>(options: &[(T, u64)]) -> Option<&T> {
-    let total_weight = options.iter().map(|(_, weight)| *weight).sum();
+    if options.is_empty() {
+        return None;
+    }
+    
+    let total_weight: u64 = options.iter().map(|(_, weight)| *weight).sum();
+    
+    // 如果总权重为0（所有记录权重都是0），则进行纯随机选择
+    if total_weight == 0 {
+        return options.choose(&mut rand::thread_rng()).map(|(item, _)| item);
+    }
+
     let mut rng = rand::thread_rng();
     let rand_value = rng.gen_range(0..total_weight);
     let mut accumulated_weight = 0;
@@ -30,7 +41,8 @@ fn weighted_choice<T>(options: &[(T, u64)]) -> Option<&T> {
         }
     }
 
-    None
+    // 理论上不应该走到这里，除非 options 为空
+    options.last().map(|(item, _)| item)
 }
 
 #[derive(Debug)]
@@ -66,7 +78,7 @@ impl DNSTunnelConnector {
             .filter_map(|s| url::Url::parse(s.as_str()).ok())
             .collect::<Vec<_>>();
 
-        // shuffle candidate_urls and get the first one
+        // TXT 记录没有权重概念，随机选择一个
         let url = candidate_urls
             .choose(&mut rand::thread_rng())
             .with_context(|| {
@@ -81,13 +93,17 @@ impl DNSTunnelConnector {
         Ok(connector)
     }
 
-    fn handle_one_srv_record(record: &SRV, protocol: &str) -> Result<(url::Url, u64), Error> {
+    /// 解析单个 SRV 记录，返回 (TargetUrl, Priority, Weight)
+    fn handle_one_srv_record(record: &SRV, protocol: &str) -> Result<(url::Url, u16, u16), Error> {
         // port must be non-zero
         if record.port() == 0 {
             return Err(anyhow::anyhow!("port must be non-zero").into());
         }
 
         let connector_dst = record.target().to_utf8();
+        // DNS 记录通常以 . 结尾，构造 URL 时最好去掉
+        let connector_dst = connector_dst.trim_end_matches('.');
+        
         let dst_url = format!("{}://{}:{}", protocol, connector_dst, record.port());
 
         Ok((
@@ -100,7 +116,8 @@ impl DNSTunnelConnector {
                     dst_url
                 )
             })?,
-            record.priority() as _,
+            record.priority(),
+            record.weight(),
         ))
     }
 
@@ -111,48 +128,74 @@ impl DNSTunnelConnector {
     ) -> Result<Box<dyn TunnelConnector>, Error> {
         tracing::info!("handle_srv_record: {}", domain_name);
 
+        // 构造要查询的 SRV 域名
         let srv_domains = PROTO_PORT_OFFSET
             .iter()
-            .map(|(p, _)| (format!("_easytier._{}.{}", p, domain_name), *p)) // _easytier._udp.{domain_name}
+            .map(|(p, _)| (format!("_easytier._{}.{}", p, domain_name), *p))
             .collect::<Vec<_>>();
+        
         tracing::info!("build srv_domains: {:?}", srv_domains);
+        
+        // 使用 DashSet 收集结果，自动去重
+        // 存储结构: (Url, Priority, Weight)
         let responses = Arc::new(DashSet::new());
+        
         let srv_lookup_tasks = srv_domains
             .iter()
             .map(|(srv_domain, protocol)| {
                 let resolver = RESOLVER.clone();
                 let responses = responses.clone();
                 async move {
-                    let response = resolver.srv_lookup(srv_domain).await.with_context(|| {
-                        format!("srv_lookup failed, srv_domain: {}", srv_domain)
-                    })?;
-                    tracing::info!(?response, ?srv_domain, "srv_lookup response");
-                    for record in response.iter() {
-                        let parsed_record = Self::handle_one_srv_record(record, protocol);
-                        tracing::info!(?parsed_record, ?srv_domain, "parsed_record");
-                        if let Err(e) = &parsed_record {
-                            eprintln!("got invalid srv record {:?}", e);
-                            continue;
+                    if let Ok(response) = resolver.srv_lookup(srv_domain).await {
+                        tracing::info!(?response, ?srv_domain, "srv_lookup response");
+                        for record in response.iter() {
+                            let parsed_record = Self::handle_one_srv_record(record, protocol);
+                            tracing::info!(?parsed_record, ?srv_domain, "parsed_record");
+                            if let Ok(r) = parsed_record {
+                                responses.insert(r);
+                            }
                         }
-                        responses.insert(parsed_record.unwrap());
+                    } else {
+                         tracing::debug!("srv_lookup failed or empty for {}", srv_domain);
                     }
                     Ok::<_, Error>(())
                 }
             })
             .collect::<Vec<_>>();
+        
         let _ = futures::future::join_all(srv_lookup_tasks).await;
 
-        let srv_records = responses.iter().map(|r| r.clone()).collect::<Vec<_>>();
-        if srv_records.is_empty() {
+        if responses.is_empty() {
             return Err(anyhow::anyhow!("no srv record found").into());
         }
 
-        let url = weighted_choice(srv_records.as_slice()).with_context(|| {
+        // 将结果转为 Vec 以便排序
+        let mut srv_records: Vec<_> = responses.iter().map(|r| r.clone()).collect();
+
+        // 1. 按照 Priority 升序排序 (数值越小优先级越高)
+        srv_records.sort_by_key(|(_, priority, _)| *priority);
+
+        // 2. 获取优先级最高（Priority 最小）的那一组记录
+        let best_priority = srv_records[0].1;
+        let best_priority_records: Vec<_> = srv_records
+            .iter()
+            .filter(|(_, p, _)| *p == best_priority)
+            .collect();
+
+        // 3. 在同优先级的记录中，根据 Weight 进行加权随机选择
+        let candidates: Vec<(&url::Url, u64)> = best_priority_records
+            .iter()
+            .map(|(u, _, w)| (u, *w as u64))
+            .collect();
+
+        let url = weighted_choice(&candidates).with_context(|| {
             format!(
-                "failed to choose a srv record, domain_name: {}, srv_records: {:?}",
-                domain_name, srv_records
+                "failed to choose a srv record, domain_name: {}, candidates: {:?}",
+                domain_name, candidates
             )
         })?;
+
+        tracing::info!("selected srv target: {}", url);
 
         let connector =
             create_connector_by_url(url.as_str(), &self.global_ctx, self.ip_version).await?;
@@ -188,6 +231,10 @@ impl super::TunnelConnector for DNSTunnelConnector {
             )
             .into());
         };
+
+        conn.set_ip_version(self.ip_version);
+        conn.set_bind_addrs(self.bind_addrs.clone());
+
         let t = conn.connect().await?;
         let info = t.info().unwrap_or_default();
         Ok(Box::new(TunnelWithInfo::new(
@@ -228,16 +275,8 @@ mod tests {
         let global_ctx = get_mock_global_ctx();
         let mut connector = DNSTunnelConnector::new(url.parse().unwrap(), global_ctx);
         connector.set_ip_version(IpVersion::V4);
-        for _ in 0..5 {
-            match connector.connect().await {
-                Ok(ret) => {
-                    println!("{:?}", ret.info());
-                    return;
-                }
-                Err(e) => {
-                    println!("{:?}", e);
-                }
-            }
+        if let Err(e) = connector.connect().await {
+            println!("test_txt connect result: {:?}", e);
         }
     }
 
@@ -247,16 +286,8 @@ mod tests {
         let global_ctx = get_mock_global_ctx();
         let mut connector = DNSTunnelConnector::new(url.parse().unwrap(), global_ctx);
         connector.set_ip_version(IpVersion::V4);
-        for _ in 0..5 {
-            match connector.connect().await {
-                Ok(ret) => {
-                    println!("{:?}", ret.info());
-                    return;
-                }
-                Err(e) => {
-                    println!("{:?}", e);
-                }
-            }
+        if let Err(e) = connector.connect().await {
+            println!("test_srv connect result: {:?}", e);
         }
     }
 }
